@@ -14,8 +14,8 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 # Configure page
 st.set_page_config(
-    page_title="Document Analysis Chatbot",
-    page_icon="🤖",
+    page_title="AI Healthcare Advisor",
+    page_icon="⚕️",
     layout="wide"
 )
 
@@ -39,192 +39,193 @@ st.markdown("""
     .stTextInput > div > div > input {
         border-radius: 10px;
     }
-    .chat-container {
-        border-radius: 10px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-    }
-    .user-msg {
-        background-color: #E3F2FD;
-    }
-    .ai-msg {
-        background-color: #F5F5F5;
-    }
-    .metadata {
-        font-size: 0.8rem;
-        color: #757575;
-        margin-top: 0.3rem;
+    /* Ensures the main content area fills the available space */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Header
-st.markdown('<div class="main-header">Chatbot</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Ask questions about your documents using AI</div>', unsafe_allow_html=True)
+# --- State Initialization ---
+if "age_range" not in st.session_state:
+    st.session_state.age_range = None
+if "docs" not in st.session_state:
+    st.session_state.docs = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-# Sidebar for configuration
+
+# Header
+st.markdown('<div class="main-header">AI Healthcare Advisor for New Parents</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Select your baby\'s age in the sidebar, then ask questions about their development and care.</div>', unsafe_allow_html=True)
+
+
+# --- Sidebar for Configuration ---
 with st.sidebar:
     st.header("Configuration")
-    
-    # Index selection
-    index_from_env = os.environ.get("PINECONE_INDEX_NAME", "docs")
-    index_name = st.text_input("Pinecone Index Name", value=index_from_env)
-    
-    # Model selection
-    model_name = st.selectbox(
-        "Model",
-        ["gpt-4o", "gpt-4", "gpt-3.5-turbo"],
-        index=0
-    )
-    
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.7, 0.05)
 
-    # Retrieval settings
-    st.subheader("Retrieval Settings")
+    # Age selection
+    st.subheader("1. Select Your Baby's Age")
+    age_options = ["Please select...", "Less than 3 months", "4-7 months", "8-12 months"]
+    st.session_state.age_range = st.selectbox(
+        "Age Range:",
+        options=age_options,
+        index=0 # Default to "Please select..."
+    )
+
+    st.divider()
+
+    # AI and Retrieval Settings
+    st.subheader("2. AI & Retrieval Settings")
+
+    response_style_map = {
+        "Precise": 0.2,
+        "Balanced": 0.5,
+        "Creative": 0.8
+    }
+    response_style = st.select_slider(
+        "Response Style",
+        options=list(response_style_map.keys()),
+        value="Balanced"
+    )
+    temperature = response_style_map[response_style]
+    st.caption("Temprature")
+
     k_value = st.slider("Number of documents to retrieve", 1, 10, 3)
     threshold = st.slider("Similarity threshold", 0.1, 1.0, 0.5, 0.05)
     
     st.divider()
     st.markdown("**About**")
-    st.markdown("This chatbot analyzes documents stored in your vector database.")
+    st.markdown("This advisor provides insights based on pediatric health documents.")
+    st.info("This tool is for informational purposes only and is not a substitute for professional medical advice.")
 
-# Main content area (divide into two columns)
+
+# --- Main Content Area ---
 col1, col2 = st.columns([3, 1])
 
 with col2:
-    st.subheader("Retrieved Documents")
-    document_container = st.container()
-    document_container.markdown("*No documents retrieved yet*")
+    # Set the height of this container to match the chat history container
+    document_container = st.container(height=500)
+    if st.session_state.docs:
+        document_container.markdown(f"**Found {len(st.session_state.docs)} relevant sources:**")
+        for i, doc in enumerate(st.session_state.docs, 1):
+            score = doc.metadata.get('score', None)
+            source = doc.metadata.get('source', 'Unknown')
+            score_display = f"{score:.2f}" if isinstance(score, (int, float)) else "N/A"
+
+            document_container.markdown(f"**Source {i}** (Relevance: {score_display})")
+            document_container.markdown(f"*Origin: {source}*")
+            unique_key = f"doc_{i}_{hash(doc.page_content)}"
+            document_container.text_area(f"Content {i}", doc.page_content[:200] + "...", height=120, key=unique_key)
+    else:
+        document_container.markdown("*Retrieved sources will appear here.*")
+
 
 with col1:
-    # Check for API keys
-    api_errors = []
-    if not os.environ.get("PINECONE_API_KEY"):
-        api_errors.append("PINECONE_API_KEY not found in .env file")
-    if not os.environ.get("OPENAI_API_KEY"):
-        api_errors.append("OPENAI_API_KEY not found in .env file")
-    
-    if api_errors:
-        for error in api_errors:
-            st.error(error)
-        st.stop()
-    
-    # initialize pinecone database
+    # Initialize services first to avoid re-initialization on every run
     try:
-        pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-        index = pc.Index(index_name)
+        if 'vector_store' not in st.session_state:
+            if not os.environ.get("PINECONE_API_KEY") or not os.environ.get("OPENAI_API_KEY"):
+                st.error("API keys for Pinecone or OpenAI not found. Please check your .env file.")
+                st.stop()
+            
+            with st.spinner("Connecting to services..."):
+                index_name = os.environ.get("PINECONE_INDEX_NAME", "docs")
+                pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
+                index = pc.Index(index_name)
+                embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=os.environ.get("OPENAI_API_KEY"))
+                st.session_state.vector_store = PineconeVectorStore(index=index, embedding=embeddings)
     except Exception as e:
-        st.error(f"Error connecting to Pinecone: {str(e)}")
+        st.error(f"Error initializing services: {str(e)}")
         st.stop()
-    
-    # Initialize embeddings model + vector store
-    try:
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=os.environ.get("OPENAI_API_KEY"))
-        vector_store = PineconeVectorStore(index=index, embedding=embeddings)
-    except Exception as e:
-        st.error(f"Error initializing vector store: {str(e)}")
-        st.stop()
-    
-    # initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-        st.session_state.messages.append(SystemMessage(content="You are a document analysis expert who can answer questions about documents in the database."))
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        if isinstance(message, HumanMessage):
-            with st.chat_message("user", avatar="👤"):
+
+    # Initialize chat history
+    if not st.session_state.messages:
+        st.session_state.messages.append(SystemMessage(content="You are a helpful AI healthcare advisor for new parents..."))
+
+    # Create a container with a fixed height for the chat history
+    chat_history_container = st.container(height=500)
+    with chat_history_container:
+        for message in st.session_state.messages:
+            if isinstance(message, SystemMessage): # Don't display system messages
+                continue
+            avatar = "⚕️" if isinstance(message, AIMessage) else "👤"
+            with st.chat_message(message.type, avatar=avatar):
                 st.markdown(message.content)
-        elif isinstance(message, AIMessage):
-            with st.chat_message("assistant", avatar="🤖"):
-                st.markdown(message.content)
-        elif isinstance(message, SystemMessage):
-            # Don't display system messages to the user
-            pass
-    
-# User input
-prompt = st.chat_input("Ask a question about your documents")
-    
-# Process user input
-if prompt:
-    # Add user message
-    with st.chat_message("user", avatar="👤"):
-        st.markdown(prompt)
-    
-    st.session_state.messages.append(HumanMessage(content=prompt))
-    
-    # Show loading indicator
-    with st.spinner("Searching for relevant documents..."):
-        # Create and invoke the retriever
-        retriever = vector_store.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs={"k": k_value, "score_threshold": threshold},
-        )
+
+    # User input and processing logic is now managed in a two-step process
+    # Step 1: A new prompt is submitted
+    if prompt := st.chat_input("Ask a question about your baby's health..."):
+        # Age Check
+        if not st.session_state.age_range or st.session_state.age_range == "Please select...":
+            st.warning("Please select your baby's age from the sidebar before asking a question.")
+            st.stop()
+
+        # Add user message to state and immediately rerun to display it
+        st.session_state.messages.append(HumanMessage(content=prompt))
+        st.rerun()
+
+    # Step 2: If the last message is from the user, trigger the AI response
+    # ----------------- REPLACE THE BLOCK ABOVE WITH THIS -----------------
+
+    if st.session_state.messages and isinstance(st.session_state.messages[-1], HumanMessage):
+        last_user_prompt = st.session_state.messages[-1].content
         
-        docs_with_scores = vector_store.similarity_search_with_score(prompt, k=k_value)
-        docs = []
-        for doc, score in docs_with_scores:
-            doc.metadata['score'] = score
-            docs.append(doc)
-    
-    #Retrieved documents in the sidebar
-    with document_container:
-        if docs:
-            document_container.markdown(f"**Found {len(docs)} relevant documents:**")
-            for i, doc in enumerate(docs, 1):
-                score = doc.metadata.get('score', None)
-                source = doc.metadata.get('source', 'Unknown')
+        # Use a spinner within the chat container for a better UX
+        with chat_history_container:
+            with st.spinner("Searching for relevant information..."):
                 
-                if isinstance(score, (int, float)):
-                    score_display = f"{score:.2f}"
-                else:
-                    score_display = "N/A"
+                # --- START: METADATA FILTERING LOGIC ---
+                search_kwargs = {"k": k_value, "score_threshold": threshold}
+
+                # Map user-friendly age selection from the sidebar to the folder names used as metadata
+                age_metadata_map = {
+                    "Less than 3 months": "birth-3months",
+                    "4-7 months": "4-7months",
+                    "8-12 months": "8-12months" # Ensure you have a folder named '8-12months' for this to work
+                }
                 
-                document_container.markdown(f"**Doc {i}** (Score: {score_display})")
-                document_container.markdown(f"*Source: {source}*")
-                document_container.text_area(f"Content {i}", doc.page_content[:150] + "...", height=100, key=f"doc_{i}")
-        else:
-            document_container.markdown("*No relevant documents found*")
-    
-    docs_text = "".join(d.page_content for d in docs)
-    
-    # Create system prompt
-    system_prompt = """You are an AI assistant specialized in analyzing documents. 
-    Your task is to provide accurate and helpful answers based on the information in the documents.
-    
-    If no relevant documents are found or the question is outside the scope of the provided documents, 
-    politely inform the user that you don't have enough information to answer accurately.
-    
-    When answering, refer to specific parts of the documents when appropriate.
-    
-    Context from documents:
-    {context}"""
-    
-    # Populate system prompt with context
-    system_prompt_fmt = system_prompt.format(context=docs_text)
-    
-    # Add system message with context
-    context_message = SystemMessage(content=system_prompt_fmt)
-    
-    # Create message list for the LLM
-    llm_messages = [msg for msg in st.session_state.messages if isinstance(msg, (HumanMessage, AIMessage))]
-    llm_messages.insert(0, context_message)
-    
-    # Show thinking indicator
-    with st.spinner("Thinking..."):
-        # Initialize the LLM
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=temperature,
-            api_key=os.environ.get("OPENAI_API_KEY")
-        )
-        
-        # Generate response
-        result = llm.invoke(llm_messages).content
-    
-    # Display assistant response
-    with st.chat_message("assistant", avatar="🤖"):
-        st.markdown(result)
-    
-    # Save the assistant message
-    st.session_state.messages.append(AIMessage(content=result))
+                selected_age = st.session_state.age_range
+                
+                # If a valid age is selected, add the metadata filter to the search
+                if selected_age in age_metadata_map:
+                    metadata_value = age_metadata_map[selected_age]
+                    st.info(f"Filtering search for age group: **{metadata_value}**") # Optional: show user the filter is active
+                    search_kwargs['filter'] = {'age_range': metadata_value}
+                # --- END: METADATA FILTERING LOGIC ---
+
+                retriever = st.session_state.vector_store.as_retriever(
+                    search_type="similarity_score_threshold",
+                    search_kwargs=search_kwargs, # Pass the dynamically created search_kwargs
+                )
+                
+                docs_with_scores = retriever.invoke(last_user_prompt)
+                st.session_state.docs = docs_with_scores
+    # ----------------- END OF REPLACEMENT -----------------
+
+            if st.session_state.docs:
+                with st.spinner("Thinking..."):
+                    docs_text = "".join(d.page_content for d in st.session_state.docs)
+                    system_prompt = f"""You are an AI assistant specialized in analyzing healthcare documents for new parents.
+                    The user is asking about their baby who is in the **{st.session_state.age_range}** age range. Your answer must be tailored to this specific age group.
+                    Your task is to provide accurate, supportive, and helpful answers based on the information in the documents.
+                    You are not a medical professional. If a user asks for a diagnosis or medical advice that is not directly supported by the text, you must state that you cannot provide medical advice and recommend they consult a pediatrician or healthcare provider.
+                    If no relevant documents are found or the question is outside the scope of the provided documents, 
+                    politely inform the user that you don't have enough information to answer accurately for a baby that is {st.session_state.age_range}.
+                    When answering, refer to specific parts of the documents when appropriate.
+                    Context from documents:
+                    {{context}}"""
+                    
+                    system_prompt_fmt = system_prompt.format(context=docs_text)
+                    context_message = SystemMessage(content=system_prompt_fmt)
+                    llm_messages = [context_message, HumanMessage(content=last_user_prompt)]
+                    
+                    llm = ChatOpenAI(model="gpt-4o", temperature=temperature, api_key=os.environ.get("OPENAI_API_KEY"))
+                    result = llm.invoke(llm_messages).content
+            else:
+                result = "I couldn't find any relevant information in the documents to answer your question. Please try rephrasing your query."
+
+        # Append the AI's response and rerun to display everything cleanly
+        st.session_state.messages.append(AIMessage(content=result))
+        st.rerun()
